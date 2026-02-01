@@ -1,1 +1,3 @@
-# Dragon core package
+from .agent import DragonAgent
+
+__all__ = ["DragonAgent"]
