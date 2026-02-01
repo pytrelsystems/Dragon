@@ -1,1 +1,8 @@
- 
+{
+  "as_of_utc": "2026-02-01T13:00:00Z",
+  "hawk_version": "0.0.0-dev",
+  "mode": "paper",
+  "loop_state": "ok",
+  "last_tick_utc": "2026-02-01T12:59:20Z",
+  "data_freshness_sec": 40
+}
