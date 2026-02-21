@@ -1,17 +1,20 @@
 # dragon_core/agent.py
 """
-Dragon Agent — Industrial Engage Kernel (Beast Mode)
+Dragon Agent — Industrial Engage Kernel (Full Replacement)
 
-What it does per tick:
-1) Append-only ledger: runtime/dragon/dragon_ledger.jsonl
-2) Optional hawk freshness gate (runtime/hawk/status.json)
-3) Fetch X mentions using state.x_since_id (dedupe)
-4) Plan actions (daily status posts + mention replies)
-5) Hard rate-limit + policy gating (via engager)
-6) Enqueue -> Execute (X + Moltbook)
-7) Persist state (since_id + last daily post timestamps)
+Assumes:
+- @pytreldragon is the X username
+- state.json stores x_user_id + since_id
+- planner.py returns (actions, new_since_id)
+- engage.py executes outbox for X + Moltbook safely
 
-No dragon_actions_next file required.
+Env:
+  X_USER_ACCESS_TOKEN=...
+  MOLTBOOK_APP_KEY=...
+
+Optional hawk freshness gate:
+  runtime/hawk/status.json with:
+    last_tick_utc, data_freshness_sec
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from .x_client import XClient
 
 
 UTC = dt.timezone.utc
+X_USERNAME = "pytreldragon"
 
 
 # -------------------------
@@ -110,14 +114,6 @@ def _parse_last_tick_utc(value: Any) -> Optional[dt.datetime]:
 
 
 def hawk_freshness(runtime_dir: Path, ledger: Ledger, *, limit_sec: int = 180) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "hawk_present": bool,
-        "freshness_ok": bool,
-        "reason": str
-      }
-    """
     status_path = runtime_dir / "hawk" / "status.json"
     if not status_path.exists():
         return {"hawk_present": False, "freshness_ok": True, "reason": "NO_HAWK_STATUS"}
@@ -162,28 +158,33 @@ class DragonAgent:
 
         ledger.info("RUN_START", "Dragon tick started", {"runtime": str(runtime_dir), "mandate": self.mandate})
 
-        # Load + touch state
+        # State
         state = load_state(runtime_dir)
         touch_run(state)
 
-        # Hawk freshness gate
+        # Freshness gate
         f = hawk_freshness(runtime_dir, ledger)
         freshness_ok = bool(f.get("freshness_ok", True))
         ledger.info("HAWK_FRESHNESS", str(f.get("reason")), {"freshness_ok": freshness_ok, "hawk_present": f.get("hawk_present")})
 
-        # Fetch mentions with since_id
+        # Mentions payload + since_id update
         mentions_payload: Optional[Dict[str, Any]] = None
         try:
             x = XClient.from_env()
-            me = x.me()
-            uid = me["data"]["id"]
-            mentions_payload = x.mentions(uid, since_id=state.x_since_id, max_results=10)
-            cnt = len((mentions_payload.get("data") or []))
-            ledger.info("X_MENTIONS_FETCHED", f"count={cnt}", {"since_id": state.x_since_id})
-        except Exception as e:
-            ledger.warn("X_MENTIONS_SKIPPED", str(e), {"since_id": state.x_since_id})
 
-        # Plan actions
+            # Resolve user_id once and cache
+            if not state.x_user_id:
+                who = x.user_by_username(X_USERNAME)
+                state.x_user_id = who["data"]["id"]
+                ledger.info("X_USER_ID_RESOLVED", "cached user_id", {"username": X_USERNAME, "user_id": state.x_user_id})
+
+            mentions_payload = x.mentions(state.x_user_id, since_id=state.x_since_id, max_results=10)
+            cnt = len((mentions_payload.get("data") or []))
+            ledger.info("X_MENTIONS_FETCHED", f"count={cnt}", {"since_id": state.x_since_id, "user_id": state.x_user_id})
+        except Exception as e:
+            ledger.warn("X_MENTIONS_SKIPPED", str(e), {"since_id": state.x_since_id, "user_id": getattr(state, "x_user_id", None)})
+
+        # Plan actions (rotating daily posts handled in planner)
         actions, new_since_id = plan_actions(runtime_dir, PlanConfig(), state=state, mentions_payload=mentions_payload)
 
         # Hard rate-limit (per channel)
@@ -198,12 +199,16 @@ class DragonAgent:
 
         ledger.info("ACTIONS_PLANNED", f"count={len(filtered)}", {"sample": filtered[:2]})
 
-        # Enqueue + execute
+        # Execute
         engager = DragonEngager(runtime_dir, ledger, EngageConfig(require_freshness_ok=True))
         engager.enqueue_actions(filtered)
         engager.execute_outbox(freshness_ok=freshness_ok)
 
-        # Persist state (conservative: mark daily posts as attempted)
+        # Persist since_id
+        if new_since_id:
+            state.x_since_id = new_since_id
+
+        # Persist daily-post timestamps if we attempted daily_status posts
         now = int(time.time())
         for a in filtered:
             if a.get("type") == "post" and a.get("metadata", {}).get("kind") == "daily_status":
@@ -211,9 +216,6 @@ class DragonAgent:
                     state.last_daily_post_unix_x = now
                 if a.get("channel") == "moltbook":
                     state.last_daily_post_unix_moltbook = now
-
-        if new_since_id:
-            state.x_since_id = new_since_id
 
         save_state(runtime_dir, state)
 
