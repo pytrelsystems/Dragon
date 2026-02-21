@@ -1,9 +1,21 @@
 # dragon_core/engage.py
 """
-Engagement runtime: consume actions_next -> outbox -> execute -> receipts.
+Dragon Engage (industrial-safe)
 
-This module does NOT decide WHAT to say.
-It only enforces policy + executes permitted actions deterministically.
+- Executes social actions via outbox queue:
+    runtime/dragon/outbox/*.json  -> execute -> runtime/dragon/sent/*.json
+                                  blocked -> runtime/dragon/dead/*.json
+
+- Supports channels:
+    - moltbook (via MoltbookClient)
+    - x       (via XClient)
+
+- Safety:
+    - policy gate for every action (before enqueue + before execute)
+    - rate limit cooldown between sends
+    - idempotency via action_id filename
+    - fail-open on transient execution errors: job stays in outbox for retry
+    - fail-closed on policy violations: move to dead
 """
 
 from __future__ import annotations
@@ -13,49 +25,45 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import time
 
-from .ledger import Ledger
 from .policy import validate_action
-from .storage import QueuePaths, enqueue_actions, list_outbox, move_job, read_json, write_json_atomic
+from .storage import QueuePaths, enqueue, list_outbox, move, read_json, write_json_atomic
 from .moltbook_client import MoltbookClient
+from .x_client import XClient
 
 
 @dataclass(frozen=True)
 class EngageConfig:
-    max_per_run: int = 3
-    cooldown_sec: int = 45
-    # add per-channel cooldowns later if needed
+    # max jobs executed per run tick
+    max_per_run: int = 4
+    # seconds between posts/replies to prevent spam + rate-limits
+    cooldown_sec: int = 30
+    # if True, only execute when hawk freshness_ok == True (recommended)
+    require_freshness_ok: bool = True
 
 
 class DragonEngager:
-    def __init__(self, runtime_dir: Path, ledger: Ledger, cfg: EngageConfig) -> None:
+    """
+    Executes actions safely.
+
+    Expected ledger interface:
+      ledger.info(event_type, message, evidence_dict)
+      ledger.warn(event_type, message, evidence_dict)
+      ledger.error(event_type, message, evidence_dict)
+
+    If ledger is missing these methods, we degrade to print.
+    """
+
+    def __init__(self, runtime_dir: Path, ledger: Any, cfg: EngageConfig) -> None:
         self.paths = QueuePaths(runtime_dir=runtime_dir)
         self.ledger = ledger
         self.cfg = cfg
 
-    def run_once(self) -> int:
-        """
-        1) Read dragon_actions_next.json (if present)
-        2) Validate + enqueue to outbox
-        3) Execute up to max_per_run with cooldown + receipts
-        """
-        self._ingest_actions_next()
-        return self._execute_outbox()
+    # -------------------------
+    # Public API
+    # -------------------------
 
-    def _ingest_actions_next(self) -> None:
-        p = self.paths.actions_next_path
-        if not p.exists():
-            return
-
-        try:
-            doc = read_json(p)
-        except Exception as e:
-            self.ledger.error("ENGAGE_ACTIONS_NEXT_INVALID", str(e), {"path": str(p)})
-            return
-
-        actions = doc.get("actions") or []
-        if not isinstance(actions, list) or not actions:
-            return
-
+    def enqueue_actions(self, actions: List[Dict[str, Any]]) -> None:
+        """Policy-gate then enqueue actions into outbox."""
         allowed: List[Dict[str, Any]] = []
         blocked = 0
 
@@ -66,70 +74,119 @@ class DragonEngager:
             ok, reasons, norm = validate_action(a)
             if not ok:
                 blocked += 1
-                self.ledger.warn("ENGAGE_ACTION_BLOCKED", "policy_block", {"reasons": reasons, "action": norm})
+                self._warn("ENGAGE_ACTION_BLOCKED", "policy_block", {"reasons": reasons, "action": norm})
                 continue
             allowed.append(norm)
 
-        created = enqueue_actions(self.paths, allowed)
-        self.ledger.info(
+        created = enqueue(self.paths, allowed)
+        self._info(
             "ENGAGE_ENQUEUED",
             f"enqueued={len(created)} blocked={blocked}",
             {"created": [str(x) for x in created]},
         )
 
-        # Optional: clear actions_next after ingest to prevent re-enqueue spam
-        write_json_atomic(p, {"ts_utc": doc.get("ts_utc"), "actions": []})
+    def execute_outbox(self, *, freshness_ok: bool = True) -> int:
+        """
+        Execute queued jobs. Respects cfg.require_freshness_ok.
+        Returns 0 always unless a hard unexpected exception escapes.
+        """
+        if self.cfg.require_freshness_ok and not freshness_ok:
+            self._warn(
+                "ENGAGE_SKIPPED_STALE",
+                "freshness gate blocked engagement",
+                {"require_freshness_ok": True, "freshness_ok": freshness_ok},
+            )
+            return 0
 
-    def _execute_outbox(self) -> int:
         jobs = list_outbox(self.paths, limit=self.cfg.max_per_run)
         if not jobs:
             return 0
 
-        client = None
+        x_client: Optional[XClient] = None
+        mb_client: Optional[MoltbookClient] = None
+
         executed = 0
 
         for job_path in jobs:
             try:
                 job = read_json(job_path)
+
+                # Second policy gate at execution time (defense-in-depth)
                 ok, reasons, norm = validate_action(job)
                 if not ok:
-                    self.ledger.warn("ENGAGE_JOB_BLOCKED", "policy_block", {"reasons": reasons, "job": norm})
-                    move_job(job_path, self.paths.dead_dir)
+                    self._warn("ENGAGE_JOB_BLOCKED", "policy_block", {"reasons": reasons, "job": norm})
+                    move(job_path, self.paths.dead_dir)
                     continue
+
+                if executed > 0:
+                    time.sleep(max(1, int(self.cfg.cooldown_sec)))
 
                 channel = norm["channel"]
                 action_type = norm["type"]
                 text = norm["text"]
 
-                # Cooldown between executions (spam guard)
-                if executed > 0:
-                    time.sleep(self.cfg.cooldown_sec)
+                receipt: Dict[str, Any]
 
-                if channel == "moltbook":
-                    if client is None:
-                        client = MoltbookClient.from_env()
-                    receipt = self._exec_moltbook(client, action_type, norm)
+                if channel == "x":
+                    x_client = x_client or XClient.from_env()
+                    if action_type == "post":
+                        receipt = x_client.post(text)
+                    else:
+                        receipt = x_client.reply(norm["in_reply_to"], text)
+
+                elif channel == "moltbook":
+                    mb_client = mb_client or MoltbookClient.from_env()
+                    if action_type == "post":
+                        receipt = mb_client.create_post(text)
+                    else:
+                        receipt = mb_client.reply(norm["in_reply_to"], text)
                 else:
-                    # X executor intentionally not implemented here until you wire API.
-                    raise RuntimeError("X executor not configured")
+                    # Should never happen because policy gate blocks invalid_channel
+                    self._error("ENGAGE_EXEC_FAIL", "unknown_channel", {"channel": channel, "job": norm})
+                    move(job_path, self.paths.dead_dir)
+                    continue
 
-                # Receipt
+                # Record receipt + move to sent
                 norm["receipt"] = receipt
                 norm["executed_unix"] = int(time.time())
+
                 write_json_atomic(self.paths.sent_dir / job_path.name, norm)
-                move_job(job_path, self.paths.sent_dir)
+                move(job_path, self.paths.sent_dir)
 
                 executed += 1
-                self.ledger.info("ENGAGE_EXECUTED", f"{channel}:{action_type}", {"action_id": norm.get("action_id")})
+                self._info(
+                    "ENGAGE_EXECUTED",
+                    f"{channel}:{action_type}",
+                    {"action_id": norm.get("action_id"), "job_file": str(job_path.name)},
+                )
+
             except Exception as e:
-                self.ledger.error("ENGAGE_EXEC_FAIL", str(e), {"job": str(job_path)})
-                # leave job in outbox for retry; avoids silent drops
+                # Fail-open: leave job in outbox for retry; log error
+                self._error("ENGAGE_EXEC_FAIL", str(e), {"job": str(job_path)})
 
         return 0
 
-    def _exec_moltbook(self, client: MoltbookClient, action_type: str, action: Dict[str, Any]) -> Dict[str, Any]:
-        if action_type == "post":
-            return client.create_post(action["text"])
-        if action_type == "reply":
-            return client.reply(action["in_reply_to"], action["text"])
-        raise RuntimeError(f"Unknown action_type: {action_type}")
+    # -------------------------
+    # Logging helpers
+    # -------------------------
+
+    def _info(self, event_type: str, message: str, evidence: Dict[str, Any]) -> None:
+        fn = getattr(self.ledger, "info", None)
+        if callable(fn):
+            fn(event_type, message, evidence)
+        else:
+            print(f"[INFO] {event_type}: {message} :: {evidence}")
+
+    def _warn(self, event_type: str, message: str, evidence: Dict[str, Any]) -> None:
+        fn = getattr(self.ledger, "warn", None)
+        if callable(fn):
+            fn(event_type, message, evidence)
+        else:
+            print(f"[WARN] {event_type}: {message} :: {evidence}")
+
+    def _error(self, event_type: str, message: str, evidence: Dict[str, Any]) -> None:
+        fn = getattr(self.ledger, "error", None)
+        if callable(fn):
+            fn(event_type, message, evidence)
+        else:
+            print(f"[ERROR] {event_type}: {message} :: {evidence}")
