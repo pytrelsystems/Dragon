@@ -1,17 +1,4 @@
 # dragon_core/x_client.py
-"""
-X API v2 minimal client (no deps).
-
-Uses:
-- POST /2/tweets (create post/reply)
-- GET /2/users/me
-- GET /2/users/:id/mentions
-
-Env:
-  X_USER_ACCESS_TOKEN=...
-  X_BASE_URL=https://api.x.com
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -43,8 +30,19 @@ class XClient:
     def me(self) -> Dict[str, Any]:
         return self._get_json("/2/users/me")
 
-    def mentions(self, user_id: str, since_id: Optional[str] = None, max_results: int = 10) -> Dict[str, Any]:
-        qs = {"max_results": str(max(5, min(100, int(max_results))))}
+    def mentions(
+        self,
+        user_id: str,
+        since_id: Optional[str] = None,
+        max_results: int = 10,
+    ) -> Dict[str, Any]:
+        # Add fields + expansions so we can see author username
+        qs = {
+            "max_results": str(max(5, min(100, int(max_results)))),
+            "tweet.fields": "author_id,created_at,conversation_id,lang",
+            "expansions": "author_id",
+            "user.fields": "username,name",
+        }
         if since_id:
             qs["since_id"] = since_id
         return self._get_json(f"/2/users/{user_id}/mentions?{urllib.parse.urlencode(qs)}")
