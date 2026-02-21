@@ -29,6 +29,7 @@ class DragonState:
     """
     Stored at: runtime/dragon/state.json
     """
+    x_user_id: Optional[str] = None
     x_since_id: Optional[str] = None
     last_daily_post_unix_x: Optional[int] = None
     last_daily_post_unix_moltbook: Optional[int] = None
@@ -36,6 +37,7 @@ class DragonState:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "x_user_id": self.x_user_id,
             "x_since_id": self.x_since_id,
             "last_daily_post_unix_x": self.last_daily_post_unix_x,
             "last_daily_post_unix_moltbook": self.last_daily_post_unix_moltbook,
@@ -45,6 +47,7 @@ class DragonState:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "DragonState":
         return DragonState(
+            x_user_id=d.get("x_user_id"),
             x_since_id=d.get("x_since_id"),
             last_daily_post_unix_x=d.get("last_daily_post_unix_x"),
             last_daily_post_unix_moltbook=d.get("last_daily_post_unix_moltbook"),
@@ -59,7 +62,6 @@ def load_state(runtime_dir: Path) -> DragonState:
     try:
         return DragonState.from_dict(_read_json(p))
     except Exception:
-        # fail-closed: if corrupt, reset rather than crash
         return DragonState()
 
 
