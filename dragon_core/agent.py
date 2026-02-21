@@ -1,24 +1,17 @@
 # dragon_core/agent.py
 """
-Dragon Agent (industrial kernel)
+Dragon Agent — Industrial Engage Kernel (Beast Mode)
 
-- Maintains append-only ledger:
-    runtime/dragon/dragon_ledger.jsonl
+What it does per tick:
+1) Append-only ledger: runtime/dragon/dragon_ledger.jsonl
+2) Optional hawk freshness gate (runtime/hawk/status.json)
+3) Fetch X mentions using state.x_since_id (dedupe)
+4) Plan actions (daily status posts + mention replies)
+5) Hard rate-limit + policy gating (via engager)
+6) Enqueue -> Execute (X + Moltbook)
+7) Persist state (since_id + last daily post timestamps)
 
-- Optional hawk awareness:
-    runtime/hawk/status.json with fields:
-      - last_tick_utc (ISO string)
-      - data_freshness_sec (number)
-
-If hawk isn't present, Dragon still engages on a safe cadence, but engagement can be gated
-by freshness_ok when hawk data exists.
-
-No dragon_actions_next required:
-- Planner generates actions each tick
-- Engager enqueues into outbox and executes
-
-Run patterns (wherever you run your python):
-- instantiate DragonAgent and call .run_once(runtime_dir)
+No dragon_actions_next file required.
 """
 
 from __future__ import annotations
@@ -28,12 +21,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 import datetime as dt
 import json
-import os
 import time
 import uuid
 
-from .planner import plan_actions, PlanConfig
 from .engage import DragonEngager, EngageConfig
+from .planner import plan_actions, PlanConfig
+from .ratelimit import RateLimiter
+from .state import load_state, save_state, touch_run
 from .x_client import XClient
 
 
@@ -121,12 +115,10 @@ def hawk_freshness(runtime_dir: Path, ledger: Ledger, *, limit_sec: int = 180) -
       {
         "hawk_present": bool,
         "freshness_ok": bool,
-        "reason": str,
-        "status": optional dict
+        "reason": str
       }
     """
-    hawk_dir = runtime_dir / "hawk"
-    status_path = hawk_dir / "status.json"
+    status_path = runtime_dir / "hawk" / "status.json"
     if not status_path.exists():
         return {"hawk_present": False, "freshness_ok": True, "reason": "NO_HAWK_STATUS"}
 
@@ -140,18 +132,16 @@ def hawk_freshness(runtime_dir: Path, ledger: Ledger, *, limit_sec: int = 180) -
     freshness_sec = status.get("data_freshness_sec")
 
     if last_tick is None or not isinstance(freshness_sec, (int, float)):
-        return {"hawk_present": True, "freshness_ok": False, "reason": "MISSING_FIELDS", "status": status}
+        return {"hawk_present": True, "freshness_ok": False, "reason": "MISSING_FIELDS"}
 
-    now = _now_utc()
-    age = (now - last_tick).total_seconds()
-
+    age = (_now_utc() - last_tick).total_seconds()
     if age > limit_sec:
-        return {"hawk_present": True, "freshness_ok": False, "reason": f"STALE_LAST_TICK_{int(age)}s", "status": status}
+        return {"hawk_present": True, "freshness_ok": False, "reason": f"STALE_LAST_TICK_{int(age)}s"}
 
     if float(freshness_sec) > float(limit_sec):
-        return {"hawk_present": True, "freshness_ok": False, "reason": f"STALE_FRESHNESS_{int(float(freshness_sec))}s", "status": status}
+        return {"hawk_present": True, "freshness_ok": False, "reason": f"STALE_FRESHNESS_{int(float(freshness_sec))}s"}
 
-    return {"hawk_present": True, "freshness_ok": True, "reason": "OK", "status": status}
+    return {"hawk_present": True, "freshness_ok": True, "reason": "OK"}
 
 
 # -------------------------
@@ -172,40 +162,69 @@ class DragonAgent:
 
         ledger.info("RUN_START", "Dragon tick started", {"runtime": str(runtime_dir), "mandate": self.mandate})
 
-        # 1) Optional hawk freshness gate
+        # Load + touch state
+        state = load_state(runtime_dir)
+        touch_run(state)
+
+        # Hawk freshness gate
         f = hawk_freshness(runtime_dir, ledger)
         freshness_ok = bool(f.get("freshness_ok", True))
-        ledger.info("HAWK_FRESHNESS", f"{f.get('reason')}", {"freshness_ok": freshness_ok, "hawk_present": f.get("hawk_present", False)})
+        ledger.info("HAWK_FRESHNESS", str(f.get("reason")), {"freshness_ok": freshness_ok, "hawk_present": f.get("hawk_present")})
 
-        # 2) Pull X mentions (safe: if token missing, skip)
-        mentions: List[Dict[str, Any]] = []
+        # Fetch mentions with since_id
+        mentions_payload: Optional[Dict[str, Any]] = None
         try:
             x = XClient.from_env()
             me = x.me()
             uid = me["data"]["id"]
-            mentions = (x.mentions(uid, max_results=10).get("data") or [])
-            ledger.info("X_MENTIONS_FETCHED", f"count={len(mentions)}", {})
+            mentions_payload = x.mentions(uid, since_id=state.x_since_id, max_results=10)
+            cnt = len((mentions_payload.get("data") or []))
+            ledger.info("X_MENTIONS_FETCHED", f"count={cnt}", {"since_id": state.x_since_id})
         except Exception as e:
-            ledger.warn("X_MENTIONS_SKIPPED", str(e), {})
+            ledger.warn("X_MENTIONS_SKIPPED", str(e), {"since_id": state.x_since_id})
 
-        # 3) Plan actions (NO actions_next file)
-        actions = plan_actions(runtime_dir, PlanConfig(), x_mentions=mentions)
-        ledger.info("ACTIONS_PLANNED", f"count={len(actions)}", {"sample": actions[:2]})
+        # Plan actions
+        actions, new_since_id = plan_actions(runtime_dir, PlanConfig(), state=state, mentions_payload=mentions_payload)
 
-        # 4) Enqueue + execute (X + Moltbook)
+        # Hard rate-limit (per channel)
+        rl = RateLimiter(max_actions_per_window=5, window_sec=300)
+        filtered: List[Dict[str, Any]] = []
+        for a in actions:
+            ch = str(a.get("channel") or "")
+            if rl.allow(ch):
+                filtered.append(a)
+            else:
+                ledger.warn("RATE_LIMIT_BLOCK", "blocked by channel window", {"channel": ch, "action_id": a.get("action_id")})
+
+        ledger.info("ACTIONS_PLANNED", f"count={len(filtered)}", {"sample": filtered[:2]})
+
+        # Enqueue + execute
         engager = DragonEngager(runtime_dir, ledger, EngageConfig(require_freshness_ok=True))
-        engager.enqueue_actions(actions)
+        engager.enqueue_actions(filtered)
         engager.execute_outbox(freshness_ok=freshness_ok)
+
+        # Persist state (conservative: mark daily posts as attempted)
+        now = int(time.time())
+        for a in filtered:
+            if a.get("type") == "post" and a.get("metadata", {}).get("kind") == "daily_status":
+                if a.get("channel") == "x":
+                    state.last_daily_post_unix_x = now
+                if a.get("channel") == "moltbook":
+                    state.last_daily_post_unix_moltbook = now
+
+        if new_since_id:
+            state.x_since_id = new_since_id
+
+        save_state(runtime_dir, state)
 
         ledger.info("RUN_END", "Dragon tick finished", {"run_id": run_id})
         return 0
 
 
-# Optional CLI entry (won't hurt if unused)
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
 
-    p = argparse.ArgumentParser(prog="dragon-agent", description="Dragon Agent (engage kernel)")
+    p = argparse.ArgumentParser(prog="dragon-agent", description="Dragon Agent (industrial engage kernel)")
     p.add_argument("--runtime", required=True, help="Runtime dir containing dragon/ (and optionally hawk/)")
     args = p.parse_args(list(argv) if argv is not None else None)
 
