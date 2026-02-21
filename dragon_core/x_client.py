@@ -75,4 +75,4 @@ class XClient:
             req.add_header(k, v)
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {"ok": True}
+            return json.loads(raw) if raw else {"ok": True} 
