@@ -30,13 +30,14 @@ class XClient:
     def me(self) -> Dict[str, Any]:
         return self._get_json("/2/users/me")
 
-    def mentions(
-        self,
-        user_id: str,
-        since_id: Optional[str] = None,
-        max_results: int = 10,
-    ) -> Dict[str, Any]:
-        # Add fields + expansions so we can see author username
+    def user_by_username(self, username: str) -> Dict[str, Any]:
+        u = username.strip().lstrip("@")
+        if not u:
+            raise ValueError("username is empty")
+        qs = urllib.parse.urlencode({"user.fields": "id,username,name"})
+        return self._get_json(f"/2/users/by/username/{urllib.parse.quote(u)}?{qs}")
+
+    def mentions(self, user_id: str, since_id: Optional[str] = None, max_results: int = 10) -> Dict[str, Any]:
         qs = {
             "max_results": str(max(5, min(100, int(max_results)))),
             "tweet.fields": "author_id,created_at,conversation_id,lang",
