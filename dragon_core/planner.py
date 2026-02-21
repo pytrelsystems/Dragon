@@ -1,18 +1,11 @@
 # dragon_core/planner.py
 """
-Engagement planner (NO dragon_actions_next file).
+SMART planner with controlled multi-reply behavior.
 
-Outputs:
-  (actions, new_since_id)
-
-Features:
-- Rotating daily post templates (7-day cycle, per channel)
-- Evidence-backed snippet from runtime/hawk/status.json if present
-- SMART mention replies:
-    - deterministic keyword/intent classification
-    - one tailored question + one crisp statement
-    - @username prefix when available
-- Safe: no P/L flex, no promises, no predictions
+Rules:
+- Reply to each mention id at most once (handled via since_id + X)
+- Allow up to N replies per conversation in 24h (default 2)
+- Require cooldown between replies in same conversation (default 2 hours)
 """
 
 from __future__ import annotations
@@ -28,6 +21,8 @@ import time
 class PlanConfig:
     daily_post_cooldown_sec: int = 24 * 3600
     max_replies_per_run: int = 3
+    max_replies_per_convo_24h: int = 2
+    convo_reply_cooldown_sec: int = 2 * 3600  # 2 hours
 
 
 # -------------------------
@@ -39,7 +34,6 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _extract_user_map(mentions_payload: Dict[str, Any]) -> Dict[str, str]:
-    """Map author_id -> username from includes.users"""
     m: Dict[str, str] = {}
     inc = mentions_payload.get("includes") or {}
     users = inc.get("users") or []
@@ -70,10 +64,6 @@ def _max_id(tweets: List[Dict[str, Any]]) -> Optional[str]:
 
 
 def _safe_status_snippet(runtime_dir: Path) -> str:
-    """
-    Pulls a tiny evidence-backed snippet from hawk/status.json if present.
-    Never assumes keys beyond basic existence checks.
-    """
     p = runtime_dir / "hawk" / "status.json"
     if not p.exists():
         return ""
@@ -86,29 +76,23 @@ def _safe_status_snippet(runtime_dir: Path) -> str:
     lt = s.get("last_tick_utc")
     if isinstance(lt, str) and lt:
         parts.append(f"last_tick={lt}")
-
     df = s.get("data_freshness_sec")
     if isinstance(df, (int, float)):
         parts.append(f"freshness={int(df)}s")
-
-    mode = s.get("mode")
-    if isinstance(mode, str) and mode:
-        parts.append(f"mode={mode}")
-
     if not parts:
         return ""
-    return " | " + " ".join(parts[:3])
+    return " | " + " ".join(parts[:2])
 
 
 def _daily_templates() -> List[str]:
     return [
         "🐉 Dragon online. Shipping deterministic automation—evidence-first, no hype. {snip}",
         "Built another muscle today: guardrails, receipts, and ruthless simplicity. {snip}",
-        "Operating principle: if it can’t be audited, it doesn’t exist. Dragon stays deterministic. {snip}",
-        "Quiet progress > loud promises. New constraints, cleaner loops, fewer failure modes. {snip}",
-        "Automation that respects reality: rate limits, state, and fail-closed behavior. {snip}",
-        "Dragon’s job: make the system boring, reliable, and undeniable. One clean tick at a time. {snip}",
-        "No vibes. Just contracts + ledgers + execution discipline. Dragon is built to last. {snip}",
+        "Operating principle: if it can’t be audited, it doesn’t exist. {snip}",
+        "Quiet progress > loud promises. Fewer failure modes, cleaner loops. {snip}",
+        "Automation that respects reality: rate limits, state, fail-closed. {snip}",
+        "Dragon’s job: make the system boring, reliable, undeniable. {snip}",
+        "No vibes. Just contracts + ledgers + execution discipline. {snip}",
     ]
 
 
@@ -118,17 +102,14 @@ def _pick_template(channel: str, day_index: int) -> str:
     return templates[(day_index + offset) % len(templates)]
 
 
-# -------------------------
-# SMART REPLY LOGIC (deterministic)
-# -------------------------
-
+# SMART intent (same deterministic classifier)
 _KEYWORDS = {
     "agents": {"agent", "agents", "autonomous", "autonomy", "multi-agent", "workflow", "orchestration"},
-    "dev": {"code", "python", "repo", "github", "open source", "library", "package", "sdk", "api"},
-    "trading": {"market", "stocks", "options", "trading", "alpha", "edge", "signal", "pnl", "returns"},
-    "ops": {"ops", "operations", "process", "controls", "audit", "ledger", "compliance", "policy"},
+    "dev": {"code", "python", "repo", "github", "library", "package", "sdk", "api"},
+    "ops": {"ops", "operations", "process", "controls", "audit", "ledger", "policy"},
     "construction": {"construction", "dfh", "division 8", "doors", "frames", "hardware", "submittal", "rfi"},
     "security": {"security", "privacy", "auth", "token", "oauth", "keys", "credential"},
+    "trading": {"market", "stocks", "options", "trading", "alpha", "edge", "signal"},
 }
 
 
@@ -144,35 +125,52 @@ def _classify_intent(text: str) -> str:
             hits[label] = score
     if not hits:
         return "general"
-    # highest score wins; deterministic tie-break by label
     return sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
 def _smart_reply_body(intent: str) -> str:
-    """
-    1 crisp statement + 1 targeted question.
-    Keep it high-status, helpful, non-hype.
-    """
     if intent == "agents":
         return "I build agents that follow contracts, not vibes. What’s your agent’s mandate—observe, decide, or execute?"
     if intent == "dev":
-        return "I keep the code path boring: strict I/O contracts + append-only receipts. What stack are you using (Python/TS/Go) and where does state live?"
+        return "I keep it boring: strict I/O contracts + append-only receipts. What stack are you using and where does state live?"
     if intent == "ops":
-        return "I treat ops like an audit problem: evidence-first, fail-closed, deterministic outputs. What’s the one process you’d automate first?"
+        return "Ops is an audit problem: evidence-first, fail-closed, deterministic outputs. What’s your #1 automation target?"
     if intent == "construction":
-        return "I’m obsessed with eliminating rework: canonical data + deterministic checks. Are you more in estimating, submittals, or field QA?"
+        return "I’m here to kill rework: canon + deterministic checks. Are you more estimating, submittals, or field QA?"
     if intent == "security":
-        return "Security is policy + least privilege + receipts. Are you using OAuth user-context tokens, or service-to-service keys?"
+        return "Security = policy + least privilege + receipts. OAuth user-context or service keys?"
     if intent == "trading":
-        # Avoid P/L talk; keep it process-only.
-        return "I focus on execution discipline and auditability, not predictions. Are you building a scanner, an executor, or a risk governor?"
+        return "I focus on execution discipline and auditability, not predictions. Are you building a scanner, executor, or risk governor?"
     return "I’m building deterministic automation with receipts—no hype. What are you working on right now?"
 
 
-def _compose_reply(prefix: str, mention_text: str) -> str:
+def _compose_reply(prefix: str, mention_text: str) -> Tuple[str, str]:
     intent = _classify_intent(mention_text)
     body = _smart_reply_body(intent)
-    return f"{prefix}{body}".strip()
+    return f"{prefix}{body}".strip(), intent
+
+
+def _can_reply_in_convo(state: Any, convo_id: str, cfg: PlanConfig, now: int) -> bool:
+    mem = getattr(state, "convo_reply_memory", None) or {}
+    info = mem.get(convo_id) or {}
+    count = int(info.get("count_24h") or 0)
+    last = int(info.get("last_reply_unix") or 0)
+
+    if count >= cfg.max_replies_per_convo_24h:
+        return False
+    if last and (now - last) < cfg.convo_reply_cooldown_sec:
+        return False
+    return True
+
+
+def _record_reply_in_convo(state: Any, convo_id: str, now: int) -> None:
+    if getattr(state, "convo_reply_memory", None) is None:
+        state.convo_reply_memory = {}
+    mem = state.convo_reply_memory
+    info = mem.get(convo_id) or {"count_24h": 0, "last_reply_unix": 0}
+    info["count_24h"] = int(info.get("count_24h") or 0) + 1
+    info["last_reply_unix"] = now
+    mem[convo_id] = info
 
 
 # -------------------------
@@ -192,25 +190,23 @@ def plan_actions(
 
     actions: List[Dict[str, Any]] = []
 
-    # Rotating daily posts (per channel)
+    # Rotating daily posts
     for channel in ("x", "moltbook"):
         last = getattr(state, f"last_daily_post_unix_{channel}", None)
         should_post = (last is None) or ((now - int(last)) >= cfg.daily_post_cooldown_sec)
-
         if should_post:
             tmpl = _pick_template(channel, int(day_index))
-            text = tmpl.format(snip=snip).strip()
             actions.append(
                 {
                     "action_id": f"daily:{channel}:{day_index}",
                     "channel": channel,
                     "type": "post",
-                    "text": text,
+                    "text": tmpl.format(snip=snip).strip(),
                     "metadata": {"kind": "daily_status", "day_index": int(day_index)},
                 }
             )
 
-    # SMART mention replies (X)
+    # Mention replies with convo limits + cooldown
     new_since_id: Optional[str] = None
     if mentions_payload:
         tweets = mentions_payload.get("data") or []
@@ -227,12 +223,16 @@ def plan_actions(
                 if not tid:
                     continue
 
+                convo_id = str(t.get("conversation_id") or tid)
+                if not _can_reply_in_convo(state, convo_id, cfg, now):
+                    continue
+
                 author_id = str(t.get("author_id") or "")
                 uname = user_map.get(author_id)
                 prefix = f"@{uname} " if uname else ""
 
                 mention_text = str(t.get("text") or "")
-                reply_text = _compose_reply(prefix, mention_text)
+                reply_text, intent = _compose_reply(prefix, mention_text)
 
                 actions.append(
                     {
@@ -241,9 +241,13 @@ def plan_actions(
                         "type": "reply",
                         "in_reply_to": tid,
                         "text": reply_text,
-                        "metadata": {"kind": "mention_reply", "intent": _classify_intent(mention_text)},
+                        "metadata": {"kind": "mention_reply", "intent": intent, "conversation_id": convo_id},
                     }
                 )
+
+                # Reserve the slot immediately so the same tick doesn't schedule multiple replies in same convo
+                _record_reply_in_convo(state, convo_id, now)
+
                 replies += 1
 
     return actions, new_since_id
