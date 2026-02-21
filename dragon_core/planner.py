@@ -1,19 +1,9 @@
 # dragon_core/planner.py
-"""
-Engagement planner (NO dragon_actions_next file).
-
-Dragon decides actions internally:
-- Max 1 daily status post per channel per 24h
-- Reply to X mentions (dedupe)
-- Emits actions as structured dicts for the engager to enqueue/execute
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-import json
+from typing import Any, Dict, List, Optional, Set, Tuple
 import time
 
 
@@ -23,60 +13,57 @@ class PlanConfig:
     max_replies_per_run: int = 3
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _extract_user_map(mentions_payload: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Map author_id -> username from includes.users
+    """
+    m: Dict[str, str] = {}
+    inc = mentions_payload.get("includes") or {}
+    users = inc.get("users") or []
+    if isinstance(users, list):
+        for u in users:
+            try:
+                uid = str(u.get("id"))
+                uname = str(u.get("username"))
+                if uid and uname:
+                    m[uid] = uname
+            except Exception:
+                continue
+    return m
 
 
-def _sent_markers(sent_dir: Path) -> Set[str]:
-    markers: Set[str] = set()
-    if not sent_dir.exists():
-        return markers
-    for p in sent_dir.glob("*.json"):
+def _max_id(tweets: List[Dict[str, Any]]) -> Optional[str]:
+    # X ids are numeric strings; max lexicographically works if same length, but safest cast to int
+    best: Optional[int] = None
+    for t in tweets:
+        tid = t.get("id")
+        if not tid:
+            continue
         try:
-            doc = _read_json(p)
-            if isinstance(doc.get("executed_unix"), int):
-                # Track daily posts per channel
-                if doc.get("type") == "post" and doc.get("channel"):
-                    markers.add(f"posted:{doc['channel']}:{doc['executed_unix']}")
-            # Track replied-to targets
-            target = str(doc.get("in_reply_to") or "")
-            if target:
-                markers.add(f"replied:{target}")
+            n = int(str(tid))
+            best = n if best is None else max(best, n)
         except Exception:
             continue
-    return markers
+    return str(best) if best is not None else None
 
 
-def _last_post_ts(sent_dir: Path, channel: str) -> Optional[int]:
-    if not sent_dir.exists():
-        return None
-    newest: Optional[int] = None
-    for p in sent_dir.glob("*.json"):
-        try:
-            doc = _read_json(p)
-            if doc.get("channel") != channel:
-                continue
-            if doc.get("type") != "post":
-                continue
-            ts = doc.get("executed_unix")
-            if isinstance(ts, int):
-                newest = ts if newest is None else max(newest, ts)
-        except Exception:
-            continue
-    return newest
-
-
-def plan_actions(runtime_dir: Path, cfg: PlanConfig, *, x_mentions: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    sent_dir = runtime_dir / "dragon" / "sent"
-    sent = _sent_markers(sent_dir)
+def plan_actions(
+    runtime_dir: Path,
+    cfg: PlanConfig,
+    *,
+    state: Any,
+    mentions_payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Returns: (actions, new_since_id)
+    """
     now = int(time.time())
-
     actions: List[Dict[str, Any]] = []
 
-    # Daily status post (X + Moltbook)
+    # Daily posts using state timestamps
     for channel in ("x", "moltbook"):
-        last = _last_post_ts(sent_dir, channel)
-        if last is None or (now - last) >= cfg.daily_post_cooldown_sec:
+        last = getattr(state, f"last_daily_post_unix_{channel}", None)
+        if last is None or (now - int(last)) >= cfg.daily_post_cooldown_sec:
             actions.append(
                 {
                     "action_id": f"daily:{channel}:{now // cfg.daily_post_cooldown_sec}",
@@ -87,28 +74,37 @@ def plan_actions(runtime_dir: Path, cfg: PlanConfig, *, x_mentions: Optional[Lis
                 }
             )
 
-    # Replies to X mentions (deduped)
-    if x_mentions:
-        replies = 0
-        for m in x_mentions:
-            mid = str(m.get("id") or "")
-            if not mid:
-                continue
-            if f"replied:{mid}" in sent:
-                continue
-            if replies >= cfg.max_replies_per_run:
-                break
+    # Mentions replies (X)
+    new_since_id: Optional[str] = None
+    if mentions_payload:
+        tweets = mentions_payload.get("data") or []
+        if isinstance(tweets, list) and tweets:
+            new_since_id = _max_id(tweets)
+            user_map = _extract_user_map(mentions_payload)
 
-            actions.append(
-                {
-                    "action_id": f"x_reply:{mid}",
-                    "channel": "x",
-                    "type": "reply",
-                    "in_reply_to": mid,
-                    "text": "👋 Appreciate the ping. Dragon here—deterministic, evidence-only automation. What are you building?",
-                    "metadata": {"kind": "mention_reply"},
-                }
-            )
-            replies += 1
+            replies = 0
+            for t in tweets:
+                if replies >= cfg.max_replies_per_run:
+                    break
+                tid = str(t.get("id") or "")
+                if not tid:
+                    continue
 
-    return actions
+                author_id = str(t.get("author_id") or "")
+                uname = user_map.get(author_id)
+                prefix = f"@{uname} " if uname else ""
+
+                # Deterministic reply (safe, questions invite engagement)
+                actions.append(
+                    {
+                        "action_id": f"x_reply:{tid}",
+                        "channel": "x",
+                        "type": "reply",
+                        "in_reply_to": tid,
+                        "text": f"{prefix}Appreciate the ping. Dragon here—evidence-only automation, deterministic loops. What are you building?",
+                        "metadata": {"kind": "mention_reply"},
+                    }
+                )
+                replies += 1
+
+    return actions, new_since_id
